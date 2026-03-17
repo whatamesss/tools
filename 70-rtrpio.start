@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# snd-related threads → FIFO prio 92
+pgrep -f -x '.*snd.*' | while read -r pid; do
+    chrt -f -p 92 "$pid" 2>/dev/null
+done
+
+# xhci-related threads → FIFO prio 95
+pgrep -f -x '.*xhci.*' | while read -r pid; do
+    chrt -f -p 95 "$pid" 2>/dev/null
+done
+
+# eth0-related threads → FIFO prio 30 
+pgrep -f -x '.irq*.*eth0.*' | while read -r pid; do
+    chrt -f -p 30 "$pid" 2>/dev/null
+done
+
+# nvidia-related threads → FIFO prio 20
+pgrep -f -x '.irq*.*nvidia.*' | while read -r pid; do
+    chrt -f -p 20 "$pid" 2>/dev/null
+done
+
+exit 0
