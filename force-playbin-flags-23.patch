@@ -1,0 +1,18 @@
+diff --git a/gst-libs/gst/play/gstplay.c b/gst-libs/gst/play/gstplay.c
+index 3b4e3c1..abcd123 100644
+--- a/gst-libs/gst/play/gstplay.c
++++ b/gst-libs/gst/play/gstplay.c
+@@ -2606,6 +2606,12 @@ gst_play_set_use_playbin3 (GstPlay * self, gboolean use_playbin3)
+   if (self->use_playbin3) {
+     GST_DEBUG_OBJECT (self, "playbin3 enabled");
+     self->playbin = gst_element_factory_make ("playbin3", "playbin3");
++
++    /* Force low-latency behavior like: gst-play-1.0 --flags=23 */
++    if (self->playbin) {
++      g_object_set (self->playbin, "flags", 23, NULL);
++    }
++
+   } else {
+     GST_DEBUG_OBJECT (self, "playbin3 disabled");
+     self->playbin = gst_element_factory_make ("playbin", "playbin");
+
