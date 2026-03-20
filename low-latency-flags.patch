@@ -1,0 +1,45 @@
+--- a/gst-libs/gst/play/gstplay.c.orig	2026-03-19 17:08:01.224548669 -0400
++++ b/gst-libs/gst/play/gstplay.c	2026-03-19 17:16:50.167905737 -0400
+@@ -2608,10 +2608,14 @@
+   if (self->use_playbin3) {
+     GST_DEBUG_OBJECT (self, "playbin3 enabled");
+     self->playbin = gst_element_factory_make ("playbin3", "playbin3");
++
++    if (self->playbin) {
++      g_object_set (self->playbin, "flags", 34, NULL);
++    }
++
+   } else {
+     self->playbin = gst_element_factory_make ("playbin", "playbin");
+   }
+-
+   if (!self->playbin) {
+     g_error ("GstPlay: 'playbin' element not found, please check your setup");
+     g_assert_not_reached ();
+@@ -2623,12 +2627,20 @@
+     gst_play_set_playbin_video_sink (self);
+   }
+ 
+-  scaletempo = gst_element_factory_make ("scaletempo", NULL);
+-  if (scaletempo) {
+-    g_object_set (self->playbin, "audio-filter", scaletempo, NULL);
+-  } else {
+-    g_warning ("GstPlay: scaletempo element not available. Audio pitch "
+-        "will not be preserved during trick modes");
++  {
++    GstElement *afilter2;
++
++    /* Resample non‑48/96 kHz sources before PipeWire.
++     * 48 kHz and 96 kHz pass through unchanged. */
++    afilter2 = gst_parse_bin_from_description (
++        "audioresample ! audio/x-raw,rate=(int)48000,96000",
++        TRUE,
++        NULL);
++
++    g_object_set (self->playbin,
++                  "audio-filter2",
++                  afilter2,
++                  NULL);
+   }
+ 
+   self->bus = bus = gst_element_get_bus (self->playbin);

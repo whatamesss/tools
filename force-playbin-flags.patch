@@ -7,9 +7,9 @@ index 3b4e3c1..abcd123 100644
      GST_DEBUG_OBJECT (self, "playbin3 enabled");
      self->playbin = gst_element_factory_make ("playbin3", "playbin3");
 +
-+    /* Force low-latency behavior like: gst-play-1.0 --flags=23 */
++    /* Force low-latency behavior like: gst-play-1.0 --flags=X (2 is audio-only)*/
 +    if (self->playbin) {
-+      g_object_set (self->playbin, "flags", 23, NULL);
++      g_object_set (self->playbin, "flags", 2, NULL);
 +    }
 +
    } else {
