@@ -1,0 +1,99 @@
+diff --git a/gui/mainwindow.cpp b/gui/mainwindow.cpp
+index 869f535..1365ec4 100644
+--- a/gui/mainwindow.cpp
++++ b/gui/mainwindow.cpp
+@@ -177,16 +177,20 @@ MainWindow::MainWindow(QWidget* parent)
+ 	QPoint p = pos();
+ 	ActionCollection::setMainWidget(this);
+ 	trayItem = new TrayItem(this);
++
+ #ifdef QT_QTDBUS_FOUND
+-	new CantataAdaptor(this);
+-	QDBusConnection::sessionBus().registerObject("/cantata", this);
+-#endif
+-	setMinimumHeight(Utils::scaleForDpi(480));
+-	setMinimumWidth(Utils::scaleForDpi(400));
+-	QWidget* widget = new QWidget(this);
+-	setupUi(widget);
+-	setCentralWidget(widget);
+-	messageWidget->hide();
++    new CantataAdaptor(this);
++    QDBusConnection::sessionBus().registerObject("/cantata", this);
++#endif
++
++    setMinimumHeight(Utils::scaleForDpi(480));
++    setMinimumWidth(Utils::scaleForDpi(400));
++
++    QWidget* widget = new QWidget(this);
++    setupUi(widget);
++
++    setCentralWidget(widget);
++    messageWidget->hide();
+ 
+ 	// Need to set these values here, as used in library/device loading...
+ 	Song::setComposerGenres(Settings::self()->composerGenres());
+@@ -329,10 +333,20 @@ MainWindow::MainWindow(QWidget* parent)
+ 
+ 	searchPlayQueueAction->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_F));
+ #ifdef ENABLE_HTTP_STREAM_PLAYBACK
+-	streamPlayAction = ActionCollection::get()->createAction("streamplay", tr("Play HTTP Output Stream"), Icons::self()->httpStreamIcon);
+-	streamPlayAction->setCheckable(true);
+-	streamPlayAction->setChecked(false);
+-	streamPlayAction->setVisible(false);
++    // Create the HTTP stream toggle action
++    streamPlayAction = ActionCollection::get()->createAction(
++        "streamplay",
++        tr("Stream HTTP Output"),
++        Icons::self()->httpStreamIcon
++    );
++    streamPlayAction->setCheckable(true);
++    streamPlayAction->setChecked(false);
++    streamPlayAction->setVisible(false);
++
++    // Attach the action to the toolbar button created earlier
++    if (QToolButton *btn = toolbar->findChild<QToolButton*>("btnHttpStream")) {
++        btn->setDefaultAction(streamPlayAction);
++    }
+ #endif
+ 
+ 	locateAction = new Action(Icons::self()->searchIcon, tr("Locate In Library"), this);
+diff --git a/gui/mainwindow.ui b/gui/mainwindow.ui
+index 6a8e33b..857cf4f 100644
+--- a/gui/mainwindow.ui
++++ b/gui/mainwindow.ui
+@@ -79,6 +79,35 @@
+         </property>
+        </spacer>
+       </item>
++      <item>
++       <spacer name="volumeSliderSpacer">
++        <property name="orientation">
++         <enum>Qt::Horizontal</enum>
++        </property>
++        <property name="sizeType">
++         <enum>QSizePolicy::Fixed</enum>
++        </property>
++        <property name="sizeHint" stdset="0">
++         <size>
++          <width>4</width>
++          <height>4</height>
++         </size>
++        </property>
++       </spacer>
++      </item>
++      <item>
++       <widget class="QToolButton" name="btnHttpStream">
++        <property name="toolTip">
++         <string>Play HTTP Output Stream</string>
++        </property>
++        <property name="checkable">
++         <bool>true</bool>
++        </property>
++        <property name="autoRaise">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
+       <item>
+        <widget class="ToolButton" name="songInfoButton"/>
+       </item>
