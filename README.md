@@ -8,7 +8,7 @@ this repo contains helpers i've found, written, or coached a robot into writing
 
 - add-stream-button.patch - this is a patch for cantata(3.4.0) to add a nice toggle button for the http stream consumer, this is equivalent to the menu item checkbox but in a more convenient location. of course, this all depends on having 'streaming' enabled in your build.
 
-- photo_search.py - this one's really cool. it uses cuda/compute on nvidia to index photos according to their content, and presents a gui that allows for searches. it requires python 3.13, and some other things...at the time of writing i've got the following related gentoo packages:
+- photo_search.py - this one's really cool. it uses cuda/compute (or cpu) to index photos according to their content, and presents a gui that allows for searches. it requires python 3.13, and some other things...at the time of writing i've got the following related gentoo packages:
  sci-ml/pytorch-2.11.0:0
  sci-ml/transformers-5.3.0:0
  dev-python/numpy-2.3.2:0/2
