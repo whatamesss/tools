@@ -19,6 +19,6 @@ this repo contains helpers i've found, written, or coached a robot into writing
 currently missing due to dependency issues is 'torchvision' it allows a bit of a speedup, the script will detect and use it automatically. if/when that package gets fixed, i will update this comment. 
 gentoo USE flags required:+torch optional:+cuda
 bonus: you can easily change the number of images output from the default 50 to match your screen size by changing this line: hits = self.searcher.search(self.query)    to:     hits = self.searcher.search(self.query, top_k=66) ..or any number
-....now with duplicate image locator!
+....now with duplicate image locator! *just install jdupes and it will magically appear
 
 - audio.sh - this little beauty allows a remote mpd server's pulseaudio output to connect to the local pipewire server. adjust your firewall as required.  as a bonus, it raises the pipewire-pulse pid's rtprio ..something pw should already be doing, imo.
