@@ -9,15 +9,16 @@ this repo contains helpers i've found, written, or coached a robot into writing
 - add-stream-button.patch - this is a patch for cantata(3.4.0) to add a nice toggle button for the http stream consumer, this is equivalent to the menu item checkbox but in a more convenient location. of course, this all depends on having 'streaming' enabled in your build.
 
 - photo_search.py - this one's really cool. it uses cuda/compute (or cpu) to index photos according to their content, and presents a gui that allows for searches. it requires python 3.13, and some other things...at the time of writing i've got the following related gentoo packages:
- sci-ml/pytorch-2.11.0:0
- sci-ml/transformers-5.3.0:0
- dev-python/numpy-2.3.2:0/2
- dev-python/pillow-12.1.1:0
- dev-python/pyqt6-6.10.2:0
- x11-drivers/nvidia-drivers-580.142:0/580
- dev-util/nvidia-cuda-toolkit-12.9.1-r1:0/12.9.1
+ sci-ml/pytorch-2.11.0
+ sci-ml/transformers-5.3.0
+ dev-python/numpy-2.3.5
+ dev-python/pillow-12.1.1
+ dev-python/pyqt6-6.10.2
+ x11-drivers/nvidia-drivers-580.142
+ dev-util/nvidia-cuda-toolkit-12.9.1-r1
 currently missing due to dependency issues is 'torchvision' it allows a bit of a speedup, the script will detect and use it automatically. if/when that package gets fixed, i will update this comment. 
 gentoo USE flags required:+torch optional:+cuda
 bonus: you can easily change the number of images output from the default 50 to match your screen size by changing this line: hits = self.searcher.search(self.query)    to:     hits = self.searcher.search(self.query, top_k=66) ..or any number
+....now with duplicate image locator!
 
 - audio.sh - this little beauty allows a remote mpd server's pulseaudio output to connect to the local pipewire server. adjust your firewall as required.  as a bonus, it raises the pipewire-pulse pid's rtprio ..something pw should already be doing, imo.
