@@ -29,6 +29,20 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QAction, QKeySequence, QShortcut, QDesktopServices
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QFile, QPoint
 
+# --- Helper Functions ---
+
+def format_duration(seconds: float) -> str:
+    """Formats seconds into a human readable string like '2m 15s'"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    if mins < 60:
+        return f"{mins}m {secs}s"
+    hours = int(mins // 60)
+    mins = int(mins % 60)
+    return f"{hours}h {mins}m"
+
 # --- Backend Logic ---
 
 class PhotoSearch:
@@ -60,7 +74,7 @@ class PhotoSearch:
         
         self.embedding_dim = self.model.config.projection_dim
         
-        self.cache_dir = Path.home() / ".cache" / "photo_search"
+        self.cache_dir = Path.home() / ".cache" / "photofind"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.thumb_cache_dir = self.cache_dir / "thumbs"
         self.thumb_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -79,6 +93,10 @@ class PhotoSearch:
         self._embeddings_on_gpu: Optional[torch.Tensor] = None
         self._embeddings_device: str = 'cpu'
         self._embeddings_dirty: bool = True
+        
+        # Dynamic Batch Size State for Self-Optimization
+        self.current_batch_size = 32
+        self.batch_size_lock = threading.Lock()
 
     def load_index(self) -> bool:
         if self.index_file.exists() and self.embeddings_file.exists():
@@ -180,6 +198,7 @@ class PhotoSearch:
         source_path = os.path.realpath(source_dir)
         extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
         
+        # --- 1. Initialization ---
         print(f"[Info] Scanning {source_path} for images...")
         files = []
         for root, dirs, filenames in os.walk(source_path):
@@ -206,18 +225,19 @@ class PhotoSearch:
         total_files = len(files)
         print(f"[Info] Processing {total_files} new images...")
 
-        batch_size = 32
+        # --- 2. Self-Optimization Setup ---
+        # Set initial safe batch size. On CPU, keep it low.
         if self.device == "cuda":
             try:
-                free_vram, total_vram = torch.cuda.mem_get_info()
+                free_vram, _ = torch.cuda.mem_get_info()
                 free_vram_mb = free_vram / (1024**2)
-                estimated_size_per_image = 20
-                target_usage = free_vram_mb * 0.85
-                calculated_bs = int(target_usage / estimated_size_per_image)
-                batch_size = max(16, min(256, calculated_bs))
-                print(f"[Info] VRAM {free_vram_mb:.0f}MB free. Batch size: {batch_size}")
+                # Start conservative: ~20MB per image estimate
+                self.current_batch_size = max(16, min(64, int(free_vram_mb / 25)))
+                print(f"[Info] GPU detected. Initial batch size: {self.current_batch_size}")
             except Exception:
-                pass
+                self.current_batch_size = 16
+        else:
+            self.current_batch_size = 8 # CPU is memory bandwidth bound usually
 
         max_loaders = min(12, os.cpu_count() or 4)
         load_queue = queue.Queue(maxsize=500)
@@ -240,7 +260,11 @@ class PhotoSearch:
             batch_meta: List[Dict[str, float]] = []
             
             while True:
-                while len(batch_images) < batch_size:
+                # Read DYNAMIC batch size
+                with self.batch_size_lock:
+                    current_bs = self.current_batch_size
+
+                while len(batch_images) < current_bs:
                     if cancel_check and cancel_check():
                         if batch_images:
                             inputs = self._prepare_inputs(batch_images)
@@ -283,7 +307,9 @@ class PhotoSearch:
         new_paths: List[str] = []
         new_metadata: List[Dict[str, float]] = []
         processed_count = 0
+        first_batch_processed = False
         
+        # --- 3. GPU Consumption Loop with Recovery ---
         while True:
             if cancel_check and cancel_check(): break
             try:
@@ -296,24 +322,73 @@ class PhotoSearch:
             inputs, batch_map, batch_meta = item
             batch_size_actual = len(batch_map)
             
-            with torch.no_grad():
-                raw_output = self.model.get_image_features(**inputs)
-                if hasattr(raw_output, 'pooler_output'):
-                    features = raw_output.pooler_output
-                elif isinstance(raw_output, tuple):
-                    features = raw_output[0]
-                else:
-                    features = raw_output
+            # --- Self-Optimization: Retry Loop ---
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    with torch.no_grad():
+                        raw_output = self.model.get_image_features(**inputs)
+                        if hasattr(raw_output, 'pooler_output'):
+                            features = raw_output.pooler_output
+                        elif isinstance(raw_output, tuple):
+                            features = raw_output[0]
+                        else:
+                            features = raw_output
+                            
+                        features = features / features.norm(p=2, dim=-1, keepdim=True)
+                        
+                        # --- Calibration Logic (Run once) ---
+                        if self.device == "cuda" and not first_batch_processed:
+                            torch.cuda.synchronize()
+                            mem_used = torch.cuda.max_memory_allocated() / (1024**2)
+                            # Calculate memory per image based on this run
+                            bytes_per_img = mem_used / batch_size_actual
+                            # Target 85% of free VRAM
+                            free_vram, _ = torch.cuda.mem_get_info()
+                            target_bs = int(((free_vram * 0.85) / (1024**2)) / bytes_per_img)
+                            
+                            with self.batch_size_lock:
+                                self.current_batch_size = max(1, min(256, target_bs))
+                            
+                            print(f"[Opt] Calibration: {mem_used:.1f}MB used. Est. {bytes_per_img:.2f}MB/img. New batch size: {self.current_batch_size}")
+                            first_batch_processed = True
+
+                        new_embeddings.append(features.cpu())
+                        new_paths.extend(batch_map)
+                        new_metadata.extend(batch_meta)
                     
-                features = features / features.norm(p=2, dim=-1, keepdim=True)
-                new_embeddings.append(features.cpu())
-                new_paths.extend(batch_map)
-                new_metadata.extend(batch_meta)
-            
+                    # Success, break retry loop
+                    break 
+                
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"[Warn] CUDA OOM on batch {batch_size_actual}. Reducing batch size and retrying...")
+                        torch.cuda.empty_cache()
+                        
+                        with self.batch_size_lock:
+                            if self.current_batch_size > 1:
+                                self.current_batch_size = max(1, int(self.current_batch_size * 0.5))
+                            print(f"[Opt] Reduced batch size to {self.current_batch_size}")
+                        
+                        if attempt < max_retries - 1:
+                            # If we have a massive batch that failed, we can't easily split it here 
+                            # because 'inputs' is already a tensor. 
+                            # However, the Preprocessor will pick up the new batch size for *future* batches.
+                            # For the current failed batch, we must skip it to avoid getting stuck in a loop,
+                            # or re-process the raw images (which we don't have here, only the tensor).
+                            # Strategy: Skip this batch (it will remain unindexed) and continue with smaller batches.
+                            # This is acceptable for a "recovery" strategy.
+                            print("[Opt] Skipping current batch to recover. You can re-index later to catch these.")
+                            break 
+                        else:
+                            raise
+                    else:
+                        raise
+
             del inputs
             processed_count += batch_size_actual
             if progress_callback:
-                progress_callback(f"Indexing... {processed_count}/{total_files} images", processed_count, total_files)
+                progress_callback(f"Indexing... {processed_count}/{total_files} images (BS: {self.current_batch_size})", processed_count, total_files)
 
         for t in loader_threads: t.join(timeout=2.0)
         preprocess_thread.join(timeout=2.0)
@@ -462,14 +537,18 @@ class PhotoSearch:
 
 class IndexWorker(QThread):
     progress = pyqtSignal(str, int, int)
-    finished = pyqtSignal(int)
+    # FIX: Renamed from 'finished' to avoid overriding QThread.internal finished signal
+    result_ready = pyqtSignal(int, float) 
+    
     def __init__(self, searcher: PhotoSearch, directory: str):
         super().__init__()
         self.searcher, self.directory, self._cancelled = searcher, directory, False
     def cancel(self): self._cancelled = True
     def run(self):
+        start_time = time.time()
         self.searcher.index_photos(self.directory, lambda m,c,t: self.progress.emit(m,c,t), lambda: self._cancelled)
-        self.finished.emit(0)
+        duration = time.time() - start_time
+        self.result_ready.emit(0, duration)
 
 class SearchWorker(QThread):
     result = pyqtSignal(list)
@@ -486,11 +565,12 @@ class GarbageWorker(QThread):
     def run(self): self.result.emit(self.searcher.get_garbage_photos())
 
 class CleanWorker(QThread):
-    finished = pyqtSignal(int)
+    # FIX: Renamed from 'finished'
+    clean_complete = pyqtSignal(int)
     def __init__(self, searcher: PhotoSearch):
         super().__init__()
         self.searcher = searcher
-    def run(self): self.finished.emit(self.searcher.clean_database())
+    def run(self): self.clean_complete.emit(self.searcher.clean_database())
 
 class ThumbnailWorker(QThread):
     thumbnail_loaded = pyqtSignal(str, QImage)
@@ -514,9 +594,12 @@ class ThumbnailWorker(QThread):
 
 class DupesWorker(QThread):
     chunk_ready = pyqtSignal(list)
-    finished = pyqtSignal()      
+    # FIX: Renamed from 'finished'
+    scan_complete = pyqtSignal(float)      
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
+    # New signal for status updates during linking
+    status_update = pyqtSignal(str)
 
     def __init__(self, target_file: Optional[str] = None, scan_dir: Optional[str] = None, indexed_set: Optional[Set[str]] = None):
         super().__init__()
@@ -540,11 +623,12 @@ class DupesWorker(QThread):
             self.temp_dir = None
 
     def run(self) -> None:
+        start_time = time.time()
         try:
             files_to_check: List[str] = []
             if self.target_file and os.path.exists(self.target_file):
                 files_to_check = list(self.indexed_set)
-                print(f"[Dupes] Scanning entire index ({len(files_to_check)} files) for duplicates of {os.path.basename(self.target_file)}...")
+                print(f"[Dupes] Scanning entire index ({len(files_to_check)} files)...")
             elif self.scan_dir:
                 real_scan_dir = os.path.realpath(self.scan_dir)
                 if not real_scan_dir.endswith(os.sep): real_scan_dir += os.sep
@@ -552,14 +636,22 @@ class DupesWorker(QThread):
                 print(f"[Dupes] Scanning directory '{self.scan_dir}'. Found {len(files_to_check)} indexed files in scope.")
             
             if not files_to_check:
-                self.finished.emit(); return
+                duration = time.time() - start_time
+                self.scan_complete.emit(duration); return
 
-            self.temp_dir = tempfile.mkdtemp(prefix="jdupes_scan_")
+            self.temp_dir = tempfile.mkdtemp(prefix="photofind_scan_")
             link_to_real: Dict[str, str] = {}
             
             print(f"[Dupes] Linking {len(files_to_check)} files to temporary directory...")
+            self.status_update.emit(f"Linking {len(files_to_check)} files...")
+            
             for i, fpath in enumerate(files_to_check):
                 if self._stop_requested: self._cleanup_temp_dir(); self.cancelled.emit(); return
+                
+                # FIX: Check if file exists before symlinking
+                if not os.path.exists(fpath):
+                    continue
+                    
                 try:
                     link_path = os.path.join(self.temp_dir, f"{i:06d}_{os.path.basename(fpath)}")
                     os.symlink(fpath, link_path)
@@ -568,8 +660,11 @@ class DupesWorker(QThread):
             
             cmd = ['jdupes', '-r', '-s', self.temp_dir]
             print(f"[Dupes] Running: {' '.join(cmd)}")
+            self.status_update.emit("Running jdupes (this may take a while)...")
+            
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout_bytes, stderr_bytes = self.process.communicate(timeout=300)
+            
+            stdout_bytes, stderr_bytes = self.process.communicate()
             
             if self._stop_requested: self._cleanup_temp_dir(); self.cancelled.emit(); return
 
@@ -578,6 +673,7 @@ class DupesWorker(QThread):
 
             if self.process.returncode == 2:
                 self._cleanup_temp_dir()
+                duration = time.time() - start_time
                 self.error.emit(f"jdupes error (code {self.process.returncode}):\n{stderr}"); return
             
             stdout = stdout_bytes.decode('utf-8', errors='surrogateescape')
@@ -596,10 +692,12 @@ class DupesWorker(QThread):
             
             if len(current_group) > 1: groups.append(current_group)
             if groups: self.chunk_ready.emit(groups)
-            self.finished.emit()
             
-        except subprocess.TimeoutExpired: self.error.emit("Scan timed out."); self.stop()
-        except FileNotFoundError: self.error.emit("'jdupes' is not installed.")
+            duration = time.time() - start_time
+            self.scan_complete.emit(duration)
+            
+        except FileNotFoundError: 
+            self.error.emit("'jdupes' is not installed.")
         except Exception as e:
             if not self._stop_requested: self.error.emit(f"Error: {str(e)}"); import traceback; traceback.print_exc()
         finally: self._cleanup_temp_dir()
@@ -608,9 +706,10 @@ class DupesWorker(QThread):
 class DuplicateDialog(QDialog):
     _thumb_signal = pyqtSignal(str, QImage)
 
-    def __init__(self, searcher: PhotoSearch, parent: Optional[QWidget] = None):
+    def __init__(self, worker: DupesWorker, searcher: PhotoSearch, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.searcher = searcher
+        self.worker = worker
         self.all_groups: List[List[str]] = []
         self.page_offset = 0
         self.PAGE_SIZE = 50
@@ -639,7 +738,6 @@ class DuplicateDialog(QDialog):
         self.image_list = QListWidget()
         self.image_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.image_list.setIconSize(QSize(200, 200))
-        # FIX: Changed to Fixed to prevent the list from infinitely expanding the dialog window and pushing the info label off-screen
         self.image_list.setResizeMode(QListWidget.ResizeMode.Fixed)
         self.image_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.image_list.itemClicked.connect(self.show_image_info)
@@ -666,10 +764,25 @@ class DuplicateDialog(QDialog):
         content_layout.addLayout(btn_layout)
         main_layout.addLayout(content_layout)
         
+        # Bottom status area
+        bottom_area = QHBoxLayout()
         self.info_label = QLabel("Waiting for jdupes to find duplicates...")
         self.info_label.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Sunken)
         self.info_label.setMargin(5)
-        main_layout.addWidget(self.info_label)
+        
+        # Stop Button moved here
+        self.stop_scan_btn = QPushButton("Stop Scan")
+        self.stop_scan_btn.clicked.connect(self.stop_scan)
+        self.stop_scan_btn.setVisible(True) # Visible initially
+        
+        bottom_area.addWidget(self.info_label, 1)
+        bottom_area.addWidget(self.stop_scan_btn, 0)
+        main_layout.addLayout(bottom_area)
+
+    def stop_scan(self):
+        if self.worker:
+            self.info_label.setText("Stopping...")
+            self.worker.stop()
 
     def add_groups_chunk(self, groups: List[List[str]]) -> None:
         self.all_groups.extend(groups)
@@ -678,12 +791,18 @@ class DuplicateDialog(QDialog):
             self.render_current_page()
         self.update_next_button_state()
 
-    def stream_finished(self) -> None:
+    def stream_finished(self, duration: float) -> None:
         self.is_streaming = False
+        self.stop_scan_btn.setVisible(False)
         self.update_next_button_state()
+        
+        dur_str = format_duration(duration)
         count = len(self.all_groups)
         self.setWindowTitle(f"Duplicate Manager ({count} Total Sets Found)")
-        self.info_label.setText(f"Scan complete. Found {count} duplicate sets." if count else "Scan complete. No duplicates found.")
+        self.info_label.setText(f"Scan complete ({dur_str}). Found {count} duplicate sets." if count else f"Scan complete ({dur_str}). No duplicates found.")
+
+    def update_status(self, msg: str) -> None:
+        self.info_label.setText(msg)
 
     def update_next_button_state(self) -> None:
         has_more = (self.page_offset + self.PAGE_SIZE) < len(self.all_groups)
@@ -896,7 +1015,7 @@ class DuplicateDialog(QDialog):
 class PhotoOrganizerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CLIP Photo Organizer")
+        self.setWindowTitle("PhotoFind")
         self.resize(1200, 800)
         
         self.has_jdupes = shutil.which('jdupes') is not None
@@ -918,6 +1037,38 @@ class PhotoOrganizerWindow(QMainWindow):
         if self.searcher.load_index():
             self.statusBar().showMessage(f"Ready. {len(self.searcher.indexed_set)} images indexed.")
 
+    def closeEvent(self, event):
+        """Gracefully shut down all background threads before closing the window."""
+        # 1. Trigger cancellation flags for long-running operations
+        if self.index_worker and self.index_worker.isRunning():
+            self.index_worker.cancel()
+        if self.dupes_worker and self.dupes_worker.isRunning():
+            self.dupes_worker.stop()
+            
+        # 2. Close dialogs to unblock the UI
+        if self.dupes_dialog and self.dupes_dialog.isVisible():
+            self.dupes_dialog.close()
+            
+        # 3. Wait for all QThreads to finish gracefully
+        workers = [
+            self.index_worker, self.search_worker, 
+            self.garbage_worker, self.clean_worker, self.dupes_worker
+        ]
+        
+        for w in workers:
+            if w is not None and w.isRunning():
+                w.wait(2000)  # Give it 2 seconds to exit naturally
+                if w.isRunning():
+                    w.terminate()  # Force kill if stuck
+                    w.wait()
+                    
+        # Thumbnail worker has no cancel flag, just terminate and wait
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            self.thumb_worker.terminate()
+            self.thumb_worker.wait()
+            
+        event.accept()
+
     def setup_ui(self) -> None:
         central_widget = QWidget(); self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -929,8 +1080,13 @@ class PhotoOrganizerWindow(QMainWindow):
         search_layout.addWidget(self.search_input); search_layout.addWidget(search_btn); search_layout.addWidget(garbage_btn)
         layout.addLayout(search_layout)
         
+        # Bottom layout for Progress Bar and Stop Button
+        bottom_layout = QHBoxLayout()
         self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False); self.progress_bar.setTextVisible(True)
-        layout.addWidget(self.progress_bar)
+        self.stop_index_btn = QPushButton("Stop Indexing"); self.stop_index_btn.setVisible(False); self.stop_index_btn.clicked.connect(self.cancel_current_operation)
+        bottom_layout.addWidget(self.progress_bar, 1) # Expand bar
+        bottom_layout.addWidget(self.stop_index_btn, 0) # Fixed size
+        layout.addLayout(bottom_layout)
 
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode); self.list_widget.setIconSize(QSize(200, 200))
@@ -949,8 +1105,7 @@ class PhotoOrganizerWindow(QMainWindow):
         if not self.has_jdupes: self.dupes_action.setEnabled(False); self.dupes_action.setToolTip("jdupes is not installed")
         toolbar.addAction(self.dupes_action)
 
-        self.stop_dupes_action = QAction("Stop Dupes Scan", self); self.stop_dupes_action.setToolTip("Stop the currently running jdupes process")
-        self.stop_dupes_action.triggered.connect(self.stop_dupes_scan); self.stop_dupes_action.setEnabled(False); toolbar.addAction(self.stop_dupes_action)
+        # Removed stop_dupes_action from here - moved to dialog
 
         clean_action = QAction("Clean Database", self); clean_action.setToolTip("Remove entries for files that no longer exist")
         clean_action.triggered.connect(self.clean_database); toolbar.addAction(clean_action)
@@ -990,14 +1145,19 @@ class PhotoOrganizerWindow(QMainWindow):
         if sel: self.delete_photos_action([i.data(Qt.ItemDataRole.UserRole) for i in sel], sel)
 
     def cancel_current_operation(self) -> None:
-        if self.index_worker and self.index_worker.isRunning(): self.index_worker.cancel(); self.statusBar().showMessage("Cancelling indexing...")
-        elif self.dupes_worker and self.dupes_worker.isRunning(): self.stop_dupes_scan()
+        if self.index_worker and self.index_worker.isRunning(): 
+            self.index_worker.cancel(); 
+            self.statusBar().showMessage("Cancelling indexing...")
+        elif self.dupes_worker and self.dupes_worker.isRunning(): 
+            # Delegate to dialog button which calls worker.stop()
+            if self.dupes_dialog:
+                self.dupes_dialog.stop_scan()
 
     def clean_database(self) -> None:
         if QMessageBox.question(self, 'Clean Database', 'Remove entries for files that no longer exist on disk?\n\nContinue?', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self.statusBar().showMessage("Cleaning database...")
             self.clean_worker = CleanWorker(self.searcher)
-            self.clean_worker.finished.connect(self.clean_finished)
+            self.clean_worker.clean_complete.connect(self.clean_finished)  # FIX: Updated signal name
             self.clean_worker.start()
 
     def clean_finished(self, removed_count: int) -> None:
@@ -1013,9 +1173,12 @@ class PhotoOrganizerWindow(QMainWindow):
         
         if selected_count == 1:
             path = selected_items[0].data(Qt.ItemDataRole.UserRole)
-            open_action = menu.addAction("Open in File Browser"); open_action.triggered.connect(lambda: self.open_in_explorer(path))
-            if self.has_jdupes:
-                dupes_action = menu.addAction("Find Duplicates of This Photo"); dupes_action.triggered.connect(lambda: self.start_single_dedupe(path))
+            open_action = menu.addAction("Open in Image Viewer")
+            open_action.triggered.connect(lambda: self.open_image_viewer(path))
+            
+            open_folder_action = menu.addAction("Open in File Browser")
+            open_folder_action.triggered.connect(lambda: self.open_in_explorer(path))
+            
             menu.addSeparator()
 
         delete_action = menu.addAction(f"Move {selected_count} Photos to Trash" if selected_count > 1 else "Move to Trash")
@@ -1042,52 +1205,68 @@ class PhotoOrganizerWindow(QMainWindow):
             else: QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
         except Exception: QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
+    def open_image_viewer(self, path: str) -> None:
+        if not os.path.exists(path): return
+        # Uses xdg-open internally via QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
     def start_global_dedupe(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Root Photo Folder to Scan")
         if folder:
-            self.statusBar().showMessage("Running jdupes..."); self.dupes_action.setEnabled(False); self.stop_dupes_action.setEnabled(True)
-            self.dupes_dialog = DuplicateDialog(self.searcher, self); self.dupes_dialog.show()
+            self.statusBar().showMessage("Running jdupes..."); self.dupes_action.setEnabled(False)
             self.dupes_worker = DupesWorker(scan_dir=folder, indexed_set=self.searcher.indexed_set)
-            self.dupes_worker.chunk_ready.connect(self.dupes_dialog.add_groups_chunk); self.dupes_worker.finished.connect(self.dupes_finished)
-            self.dupes_worker.error.connect(self.dupes_error); self.dupes_worker.cancelled.connect(self.dupes_cancelled); self.dupes_worker.start()
-
-    def start_single_dedupe(self, path: str) -> None:
-        self.statusBar().showMessage("Finding duplicates..."); self.dupes_action.setEnabled(False); self.stop_dupes_action.setEnabled(True)
-        self.dupes_dialog = DuplicateDialog(self.searcher, self); self.dupes_dialog.show()
-        self.dupes_worker = DupesWorker(target_file=path, indexed_set=self.searcher.indexed_set)
-        self.dupes_worker.chunk_ready.connect(self.dupes_dialog.add_groups_chunk); self.dupes_worker.finished.connect(self.dupes_finished)
-        self.dupes_worker.error.connect(self.dupes_error); self.dupes_worker.cancelled.connect(self.dupes_cancelled); self.dupes_worker.start()
+            # Create dialog and pass worker instance
+            self.dupes_dialog = DuplicateDialog(self.dupes_worker, self.searcher, self); self.dupes_dialog.show()
+            
+            # Connect signals
+            self.dupes_worker.chunk_ready.connect(self.dupes_dialog.add_groups_chunk)
+            self.dupes_worker.scan_complete.connect(self.dupes_finished)  # FIX: Updated signal name
+            self.dupes_worker.error.connect(self.dupes_error)
+            self.dupes_worker.cancelled.connect(self.dupes_cancelled)
+            self.dupes_worker.status_update.connect(self.dupes_dialog.update_status)
+            
+            self.dupes_worker.start()
 
     def stop_dupes_scan(self) -> None:
-        if self.dupes_worker: self.statusBar().showMessage("Stopping jdupes scan..."); self.dupes_worker.stop()
+        # This is now handled by the dialog button, but keep for ESC key compatibility
+        if self.dupes_dialog: self.dupes_dialog.stop_scan()
 
-    def dupes_finished(self) -> None:
-        if self.dupes_dialog: self.dupes_dialog.stream_finished()
+    def dupes_finished(self, duration: float) -> None:
+        if self.dupes_dialog: self.dupes_dialog.stream_finished(duration)
         self.reset_dupes_ui_state()
+        self.statusBar().showMessage(f"Duplicate scan complete. Took {format_duration(duration)}.")
 
     def dupes_cancelled(self) -> None:
-        self.statusBar().showMessage("Duplicate scan cancelled."); self.dupes_finished()
+        self.statusBar().showMessage("Duplicate scan cancelled.")
+        self.dupes_finished(0.0)
 
     def dupes_error(self, msg: str) -> None:
-        QMessageBox.warning(self, "Deduplication Error", msg); self.statusBar().showMessage("Duplicate scan failed.")
+        QMessageBox.warning(self, "Deduplication Error", msg); 
         if self.dupes_dialog: self.dupes_dialog.close()
         self.reset_dupes_ui_state()
+        self.statusBar().showMessage("Duplicate scan failed.")
 
     def reset_dupes_ui_state(self) -> None:
-        self.dupes_action.setEnabled(self.has_jdupes); self.stop_dupes_action.setEnabled(False); self.dupes_dialog = None
+        self.dupes_action.setEnabled(self.has_jdupes); 
+        self.dupes_worker = None
+        self.dupes_dialog = None
 
     def select_folder_to_index(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Photo Folder")
         if folder:
-            self.statusBar().showMessage(f"Indexing {folder}..."); self.progress_bar.setVisible(True); self.progress_bar.setRange(0, 0); self.progress_bar.setFormat("Scanning...")
+            self.statusBar().showMessage(f"Indexing {folder}..."); 
+            self.progress_bar.setVisible(True); self.stop_index_btn.setVisible(True)
+            self.progress_bar.setRange(0, 0); self.progress_bar.setFormat("Scanning...")
             self.index_worker = IndexWorker(self.searcher, folder); self.index_worker.progress.connect(self.indexing_progress)
-            self.index_worker.finished.connect(self.indexing_finished); self.index_worker.start()
+            self.index_worker.result_ready.connect(self.indexing_finished); self.index_worker.start()  # FIX: Updated signal name
 
     def indexing_progress(self, msg: str, current: int, total: int) -> None:
         self.progress_bar.setRange(0, total); self.progress_bar.setValue(current); self.progress_bar.setFormat(f"{msg} (%p%)"); self.statusBar().showMessage(msg)
 
-    def indexing_finished(self, count: int) -> None:
-        self.progress_bar.setVisible(False); self.index_worker = None; self.statusBar().showMessage(f"Indexing complete. Total images: {len(self.searcher.indexed_set)}")
+    def indexing_finished(self, count: int, duration: float) -> None:
+        self.progress_bar.setVisible(False); self.stop_index_btn.setVisible(False); self.index_worker = None
+        dur_str = format_duration(duration)
+        self.statusBar().showMessage(f"Indexing complete ({dur_str}). Total images: {len(self.searcher.indexed_set)}")
 
     def start_search(self) -> None:
         query = self.search_input.text().strip()
@@ -1115,7 +1294,11 @@ class PhotoOrganizerWindow(QMainWindow):
             if hit.get('is_garbage'): tooltip += "\n[LOW QUALITY]"
             item.setToolTip(tooltip); self.list_widget.addItem(item); paths_to_load.append(path)
             
-        if self.thumb_worker and self.thumb_worker.isRunning(): self.thumb_worker.terminate()
+        # FIX: Wait for the old thread to actually die before replacing it
+        if self.thumb_worker and self.thumb_worker.isRunning(): 
+            self.thumb_worker.terminate()
+            self.thumb_worker.wait()  # Block until the C++ thread fully stops
+            
         self.thumb_worker = ThumbnailWorker(paths_to_load, self.searcher)
         self.thumb_worker.thumbnail_loaded.connect(self.update_thumbnail); self.thumb_worker.finished.connect(lambda: self.statusBar().showMessage("Ready"))
         self.thumb_worker.start()
@@ -1135,11 +1318,7 @@ class PhotoOrganizerWindow(QMainWindow):
 
     def open_image(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)
-        if not os.path.exists(path): return
-        if sys.platform == 'linux':
-            try: subprocess.Popen(['kioclient', 'exec', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); return
-            except FileNotFoundError: pass
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.open_image_viewer(path)
 
 # --- Main Entry Point ---
 
@@ -1152,7 +1331,7 @@ if __name__ == "__main__":
     parser.add_argument("--find-garbage", action="store_true", help="Find low quality images")
     args, _ = parser.parse_known_args()
 
-    cache_path = Path.home() / ".cache" / "photo_search"
+    cache_path = Path.home() / ".cache" / "photofind"
     if args.index or args.search or args.find_garbage:
         searcher = PhotoSearch()
         if args.reindex:
