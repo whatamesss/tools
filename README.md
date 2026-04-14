@@ -8,6 +8,5 @@ this repo contains helpers i've found, written, or coached a robot into writing
 
 - add-stream-button.patch - this is a patch for cantata(3.4.0) to add a nice toggle button for the http stream consumer, this is equivalent to the menu item checkbox but in a more convenient location. of course, this all depends on having 'streaming' enabled in your build.
 
-- audio.sh - this little beauty allows a remote mpd server's pulseaudio output to connect to the local pipewire server. adjust your firewall as required.  as a bonus, it raises the pipewire-pulse pid's rtprio ..something pw should already be doing, imo.
+- audio.sh - this little beauty allows a remote mpd server's pulseaudio output to connect to the local pipewire server. adjust your firewall as required.  as a bonus, it raises the pipewire-pulse pid's rtprio ..something pw should already be doing, imo. THIS IS FAR BETTER THAN the stream listener!
 
-- photofind - really neat way to find photos by searching for their content.. see README.md in the directory
